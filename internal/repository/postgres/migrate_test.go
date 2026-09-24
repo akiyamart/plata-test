@@ -23,7 +23,7 @@ func TestMigrateConcurrent(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	dir := filepath.Join("..", "..", "..", "..", "migrations")
+	dir := filepath.Join("..", "..", "..", "migrations")
 	const n = 4
 	var wg sync.WaitGroup
 	errs := make([]error, n)

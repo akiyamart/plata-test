@@ -93,7 +93,7 @@ func (m *memUpdates) Save(_ context.Context, req domain.UpdateRequest) error {
 	if !ok {
 		return domain.ErrUpdateNotFound
 	}
-	if cur.Status != domain.StatusProcessing {
+	if cur.Status != domain.StatusProcessing || cur.Attempts != req.Attempts {
 		return domain.ErrLostLease
 	}
 	m.byID[req.ID] = req
@@ -295,6 +295,40 @@ func TestProcessSuccess(t *testing.T) {
 	}
 	if !latest.Rate.Equal(rate) {
 		t.Fatalf("rate: %s", latest.Rate)
+	}
+}
+
+func TestProcessLostLeaseAfterReclaim(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	p := mustPair(t, "EUR/MXN")
+	req := processingReq(t, "u-reclaim", "EUR/MXN", now)
+	req.Attempts = 1
+	repo := newMemUpdates()
+	_ = repo.Create(context.Background(), req)
+	reclaimed := req
+	reclaimed.Attempts = 2
+	repo.mu.Lock()
+	repo.byID[reclaimed.ID] = reclaimed
+	repo.mu.Unlock()
+
+	q, err := domain.NewQuote(p, decimal.RequireFromString("21.5"), now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	quotes := newMemQuotes()
+	out, err := newProcess(repo, quotes, &stubRates{q: q}, now).Execute(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != OutcomeLostLease {
+		t.Fatalf("outcome: %s", out)
+	}
+	saved, _ := repo.GetByID(context.Background(), "u-reclaim")
+	if saved.Status != domain.StatusProcessing || saved.Attempts != 2 {
+		t.Fatalf("row should stay with reclaim owner, got %+v", saved)
+	}
+	if _, err := quotes.GetLatest(context.Background(), p); !errors.Is(err, domain.ErrQuoteNotFound) {
+		t.Fatalf("stale complete must not write quote, got %v", err)
 	}
 }
 

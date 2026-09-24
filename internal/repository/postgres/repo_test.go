@@ -27,7 +27,7 @@ func openTestDB(t *testing.T) *pgxpool.Pool {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	dir := filepath.Join("..", "..", "..", "..", "migrations")
+	dir := filepath.Join("..", "..", "..", "migrations")
 	if err := postgres.Migrate(ctx, pool, dir); err != nil {
 		t.Fatal(err)
 	}
@@ -202,6 +202,61 @@ func TestCorrelationIDPersisted(t *testing.T) {
 	}
 	if claimed.ID == req.ID && claimed.CorrelationID != "client-corr-xyz" {
 		t.Fatalf("claim correlation: %q", claimed.CorrelationID)
+	}
+}
+
+func TestSaveRejectedAfterReclaim(t *testing.T) {
+	pool := openTestDB(t)
+	ctx := context.Background()
+	repo := postgres.NewUpdateRepository(pool, 50*time.Millisecond, 3)
+	complete := postgres.NewCompletion(pool)
+	quotes := postgres.NewQuoteRepository(pool)
+	p, _ := domain.ParsePair("USD/MXN")
+	now := time.Now().UTC()
+	req, _ := domain.NewUpdateRequest("itest-reclaim-save-"+now.Format("150405.000000000"), p, now)
+	req = ancient(req)
+	if err := repo.Create(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	a, err := repo.ClaimNextPending(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE update_requests SET updated_at = NOW() - interval '2 seconds' WHERE id = $1`, req.ID); err != nil {
+		t.Fatal(err)
+	}
+	b, err := repo.ClaimNextPending(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, beforeErr := quotes.GetLatest(ctx, p)
+
+	q, _ := domain.NewQuote(p, decimal.RequireFromString("19.5"), now)
+	stale := a
+	if err := stale.Complete(q, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := complete.SaveCompleted(ctx, stale, q); !errors.Is(err, domain.ErrLostLease) {
+		t.Fatalf("SaveCompleted want ErrLostLease, got %v", err)
+	}
+	staleFail := a
+	if err := staleFail.Fail(domain.FailFXUnavailable, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Save(ctx, staleFail); !errors.Is(err, domain.ErrLostLease) {
+		t.Fatalf("Save want ErrLostLease, got %v", err)
+	}
+
+	got, err := repo.GetByID(ctx, req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.StatusProcessing || got.Attempts != b.Attempts {
+		t.Fatalf("row should stay with reclaim owner, got %+v", got)
+	}
+	after, afterErr := quotes.GetLatest(ctx, p)
+	if !errors.Is(beforeErr, afterErr) || (beforeErr == nil && (!before.Rate.Equal(after.Rate) || !before.ObservedAt.Equal(after.ObservedAt))) {
+		t.Fatalf("stale complete changed quote: before %v %v after %v %v", before, beforeErr, after, afterErr)
 	}
 }
 

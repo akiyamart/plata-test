@@ -16,10 +16,11 @@ import (
 
 const updateCols = `id, pair, status, rate::text, observed_at, error, attempts, idempotency_key, correlation_id, created_at, updated_at`
 
+// attempts is the claim generation: reclaim increments it, Complete and Fail do not.
 const saveUpdateSQL = `
 	UPDATE update_requests
 	SET status = $2, rate = $3, observed_at = $4, error = $5, updated_at = $6, attempts = $7
-	WHERE id = $1 AND status = 'processing'`
+	WHERE id = $1 AND status = 'processing' AND attempts = $7`
 
 // claimSaveSQL updates a row held under FOR UPDATE (pending claim or reclaim).
 const claimSaveSQL = `
