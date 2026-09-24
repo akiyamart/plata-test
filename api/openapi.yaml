@@ -1,0 +1,249 @@
+openapi: 3.0.3
+info:
+  title: quoteservice
+  description: |
+    Async FX quote updates. POST returns an update_id immediately; a worker
+    fetches the rate from exchangerate.dev and stores it in PostgreSQL.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Liveness
+      responses:
+        "200":
+          description: Process is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+  /readyz:
+    get:
+      summary: Readiness (Postgres ping)
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          description: Not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /metrics:
+    get:
+      summary: Process-local counters
+      responses:
+        "200":
+          description: JSON map of counter names to int64
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: integer
+                  format: int64
+  /v1/quotes/updates:
+    post:
+      summary: Request a quote update
+      description: |
+        Enqueues a background job and returns 202 with update_id.
+        Repeat the same Idempotency-Key (or body idempotency_key) to get the same update_id.
+        Reusing a key with a different pair returns 409.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRequest"
+            examples:
+              eurMxn:
+                value:
+                  pair: EUR/MXN
+      responses:
+        "202":
+          description: Accepted
+          headers:
+            X-Request-Id:
+              description: Echo of inbound request id, or a generated one
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateAccepted"
+        "400":
+          description: Invalid pair, JSON, or idempotency key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Idempotency key reused with a different pair
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: Request body too large
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Update queue is full
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/quotes/updates/{id}:
+    get:
+      summary: Get update by id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Current job status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Update"
+        "400":
+          description: Empty id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Unknown id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/quotes/{pair}:
+    get:
+      summary: Latest stored quote for a pair
+      parameters:
+        - name: pair
+          in: path
+          required: true
+          description: EUR-MXN (slash is also accepted then normalized)
+          schema:
+            type: string
+            example: EUR-MXN
+      responses:
+        "200":
+          description: Latest quote
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Quote"
+        "400":
+          description: Invalid pair
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No quote stored yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Client-chosen key, max 128 characters. Optional; also accepted as JSON field idempotency_key.
+      schema:
+        type: string
+        maxLength: 128
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: |
+        Optional correlation id (printable ASCII, max 100). Echoed on the response
+        and stored on the job as correlation_id for log correlation across HTTP → worker → FX.
+        If missing or invalid, the server generates one.
+      schema:
+        type: string
+        maxLength: 100
+  schemas:
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    UpdateRequest:
+      type: object
+      required: [pair]
+      properties:
+        pair:
+          type: string
+          example: EUR/MXN
+        idempotency_key:
+          type: string
+          maxLength: 128
+    UpdateAccepted:
+      type: object
+      required: [update_id]
+      properties:
+        update_id:
+          type: string
+    Update:
+      type: object
+      required: [update_id, pair, status]
+      properties:
+        update_id:
+          type: string
+        pair:
+          type: string
+          example: EUR/MXN
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        rate:
+          type: string
+          description: Present when status is completed
+        observed_at:
+          type: string
+          format: date-time
+          description: Present when status is completed
+        error:
+          type: string
+          description: Stable fail code when status is failed
+          enum: [fx_unavailable, fx_timeout, max_attempts, invalid_quote]
+    Quote:
+      type: object
+      required: [pair, rate, observed_at]
+      properties:
+        pair:
+          type: string
+          example: EUR/MXN
+        rate:
+          type: string
+          example: "21.45"
+        observed_at:
+          type: string
+          format: date-time
